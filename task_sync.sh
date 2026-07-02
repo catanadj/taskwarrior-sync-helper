@@ -397,7 +397,6 @@ perform_sync() {
         fi
     fi
 
-    echo "✅ Sync completed successfully!"
     SCRIPT_RESULT="SUCCESS"
     return 0
 }
