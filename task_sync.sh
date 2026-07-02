@@ -10,10 +10,13 @@ if [ -f "$CONFIG_FILE" ]; then
 fi
 
 # Get current system info early so config can use per-device overrides.
-timestamp=$(date '+%Y-%m-%d %H:%M:%S')
 computer_name=$(hostname)
 username=$(whoami)
 current_system="$username@$computer_name"
+
+current_timestamp() {
+    date '+%Y-%m-%d %H:%M:%S'
+}
 
 lookup_device_value() {
     table="$1"
@@ -45,6 +48,8 @@ lookup_device_path() {
 path_from_script_dir() {
     path="$1"
     case "$path" in
+        "~") printf "%s\n" "$HOME" ;;
+        "~/"*) printf "%s\n" "$HOME/${path#~/}" ;;
         ""|/*) printf "%s\n" "$path" ;;
         *) printf "%s\n" "$SCRIPT_DIR/$path" ;;
     esac
@@ -142,24 +147,26 @@ rotate_log_if_needed() {
             mv "$LOG_FILE" "${LOG_FILE}.bak"
             : > "$LOG_FILE"
             # Log rotation line is device-scoped as well
-            echo "[$timestamp] [INFO] $current_system - Log rotated (${log_size}B -> 0B), backup: ${LOG_FILE}.bak" >> "$LOG_FILE"
+            rotate_timestamp=$(current_timestamp)
+            echo "[$rotate_timestamp] [INFO] $current_system - Log rotated (${log_size}B -> 0B), backup: ${LOG_FILE}.bak" >> "$LOG_FILE"
         fi
     fi
 }
 
 # Function to write final summary log (only called once at script end)
 write_summary_log() {
-    local status="$1"
-    local action="$2"
-    local details="$3"
+    summary_status="$1"
+    summary_action="$2"
+    summary_details="$3"
+    summary_timestamp=$(current_timestamp)
 
     rotate_log_if_needed
 
     # One-line summary per device
-    if [ -n "$details" ]; then
-        echo "[$timestamp] [$status] $current_system - $action | $details" >> "$LOG_FILE"
+    if [ -n "$summary_details" ]; then
+        echo "[$summary_timestamp] [$summary_status] $current_system - $summary_action | $summary_details" >> "$LOG_FILE"
     else
-        echo "[$timestamp] [$status] $current_system - $action" >> "$LOG_FILE"
+        echo "[$summary_timestamp] [$summary_status] $current_system - $summary_action" >> "$LOG_FILE"
     fi
 }
 
@@ -200,9 +207,16 @@ check_internet() {
 # Function to update sync state file
 update_sync_state() {
     sync_type="$1"  # "WITH_CHANGES" or "NO_CHANGES"
-    echo "LAST_SYNC_TIME=$timestamp" > "$SYNC_STATE_FILE"
-    echo "LAST_SYNC_SYSTEM=$current_system" >> "$SYNC_STATE_FILE"
-    echo "LAST_SYNC_TYPE=$sync_type" >> "$SYNC_STATE_FILE"
+    state_timestamp=$(current_timestamp)
+    state_tmp="${SYNC_STATE_FILE}.tmp.$$"
+
+    {
+        echo "LAST_SYNC_TIME=$state_timestamp"
+        echo "LAST_SYNC_SYSTEM=$current_system"
+        echo "LAST_SYNC_TYPE=$sync_type"
+    } > "$state_tmp" || return 1
+
+    mv "$state_tmp" "$SYNC_STATE_FILE"
 }
 
 # Function to mark that current system has synced the latest changes
@@ -217,9 +231,10 @@ mark_system_synced() {
                 SYNCED_SYSTEMS="$current_system"
             fi
 
-            grep -v "^SYNCED_SYSTEMS=" "$SYNC_STATE_FILE" > "${SYNC_STATE_FILE}.tmp" 2>/dev/null || true
-            echo "SYNCED_SYSTEMS=$SYNCED_SYSTEMS" >> "${SYNC_STATE_FILE}.tmp"
-            mv "${SYNC_STATE_FILE}.tmp" "$SYNC_STATE_FILE"
+            state_tmp="${SYNC_STATE_FILE}.tmp.$$"
+            grep -v "^SYNCED_SYSTEMS=" "$SYNC_STATE_FILE" > "$state_tmp" 2>/dev/null || true
+            echo "SYNCED_SYSTEMS=$SYNCED_SYSTEMS" >> "$state_tmp" || return 1
+            mv "$state_tmp" "$SYNC_STATE_FILE"
         fi
     fi
 }
