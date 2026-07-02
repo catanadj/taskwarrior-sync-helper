@@ -165,7 +165,7 @@ as-is.
 ### Nautical Recovery Modes
 
 By default, the sample config enables Nautical chain repair and reconcile after
-a successful `task sync`:
+a `task sync` run:
 
 ```sh
 RUN_NAUTICAL_CHAIN_REPAIR=1
@@ -183,6 +183,12 @@ NAUTICAL_RECONCILE_APPLY=0
 
 Set `RUN_NAUTICAL_ON_NO_SYNC=1` if you also want recovery tools to run when the
 helper decides that no Taskwarrior sync is needed.
+
+When the current device already has local changes to upload, the helper runs
+Nautical recovery before `task sync`. That way any missing recurrence tasks
+spawned by `nautical_reconcile.py` are included in the same sync. When the
+helper is only pulling changes from another device, it runs Nautical recovery
+after `task sync` so it can repair or reconcile the newly pulled data.
 
 ## Decision Logic
 

@@ -296,11 +296,25 @@ run_nautical_recovery() {
     return "$recovery_status"
 }
 
+nautical_recovery_enabled() {
+    config_true "$RUN_NAUTICAL_CHAIN_REPAIR" || config_true "$RUN_NAUTICAL_RECONCILE"
+}
+
+run_nautical_recovery_and_record() {
+    if run_nautical_recovery; then
+        NAUTICAL_RECOVERY_RESULT="Nautical recovery ok"
+    else
+        echo "⚠️  Nautical recovery reported findings or errors"
+        NAUTICAL_RECOVERY_RESULT="Nautical recovery needs review"
+    fi
+}
+
 # Function to perform sync and logging
 perform_sync() {
     sync_reason="$1"
     changes_count="$2"
     sync_type="$3"  # "WITH_CHANGES" or "NO_CHANGES"
+    pre_sync_nautical_info=""
 
     SYNC_ACTION="$sync_reason"
 
@@ -317,6 +331,12 @@ perform_sync() {
         fi
 
         return 1
+    fi
+
+    if [ "$sync_type" = "WITH_CHANGES" ] && nautical_recovery_enabled; then
+        echo "🧭 Running Nautical recovery before sync so spawned tasks are included..."
+        run_nautical_recovery_and_record
+        pre_sync_nautical_info=", $NAUTICAL_RECOVERY_RESULT"
     fi
 
     # Prepare changes info for summary
@@ -369,6 +389,7 @@ perform_sync() {
     else
         CHANGES_INFO="pulled remote changes, count: $task_count_before->$task_count_after (Δ$task_delta)"
     fi
+    CHANGES_INFO="$CHANGES_INFO$pre_sync_nautical_info"
 
     # Handle state file updates
     if [ "$sync_type" = "WITH_CHANGES" ]; then
@@ -388,13 +409,10 @@ perform_sync() {
         fi
     fi
 
-    if config_true "$RUN_NAUTICAL_CHAIN_REPAIR" || config_true "$RUN_NAUTICAL_RECONCILE"; then
-        if run_nautical_recovery; then
-            CHANGES_INFO="$CHANGES_INFO, Nautical recovery ok"
-        else
-            echo "⚠️  Nautical recovery reported findings or errors"
-            CHANGES_INFO="$CHANGES_INFO, Nautical recovery needs review"
-        fi
+    if [ "$sync_type" = "NO_CHANGES" ] && nautical_recovery_enabled; then
+        echo "🧭 Running Nautical recovery after pulling remote changes..."
+        run_nautical_recovery_and_record
+        CHANGES_INFO="$CHANGES_INFO, $NAUTICAL_RECOVERY_RESULT"
     fi
 
     SCRIPT_RESULT="SUCCESS"
