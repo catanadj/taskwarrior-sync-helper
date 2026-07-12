@@ -1,0 +1,38 @@
+name: test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install shell tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes busybox shellcheck
+
+      - name: Check POSIX shell syntax
+        run: |
+          dash -n task_sync.sh tests/test_task_sync.sh task_sync.conf.example
+          busybox sh -n task_sync.sh
+          bash -n task_sync.sh tests/test_task_sync.sh
+
+      - name: Run ShellCheck
+        run: shellcheck --shell=sh task_sync.sh tests/test_task_sync.sh
+
+      - name: Run regression suite
+        run: ./tests/test_task_sync.sh
+
+      - name: Run regression suite with BusyBox
+        run: busybox sh tests/test_task_sync.sh

@@ -2,12 +2,108 @@
 
 # Get the directory where the script is located
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-CONFIG_FILE="${TASK_SYNC_CONFIG:-$SCRIPT_DIR/task_sync.conf}"
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [options]
+
+Options:
+  --config PATH       Use an explicit configuration file
+  --force             Run task sync even when no local or signaled changes exist
+  --status            Show the decision without syncing or running recovery
+  --no-nautical       Disable Nautical recovery for this run
+  -h, --help          Show this help text
+
+Default config:
+  \$XDG_CONFIG_HOME/taskwarrior-sync-helper/config
+  or ~/.config/taskwarrior-sync-helper/config
+EOF
+}
+
+CLI_FORCE_SYNC=0
+CLI_STATUS_ONLY=0
+CLI_NO_NAUTICAL=0
+CONFIG_EXPLICIT=0
+config_home="${XDG_CONFIG_HOME:-${HOME:-$SCRIPT_DIR}/.config}"
+CONFIG_FILE="$config_home/taskwarrior-sync-helper/config"
+if [ -n "${TASK_SYNC_CONFIG:-}" ]; then
+    CONFIG_FILE="$TASK_SYNC_CONFIG"
+    CONFIG_EXPLICIT=1
+fi
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --config)
+            shift
+            if [ "$#" -eq 0 ]; then
+                echo "❌ --config requires a path" >&2
+                exit 2
+            fi
+            CONFIG_FILE="$1"
+            CONFIG_EXPLICIT=1
+            ;;
+        --config=*)
+            CONFIG_FILE=${1#--config=}
+            if [ -z "$CONFIG_FILE" ]; then
+                echo "❌ --config requires a path" >&2
+                exit 2
+            fi
+            CONFIG_EXPLICIT=1
+            ;;
+        --force) CLI_FORCE_SYNC=1 ;;
+        --status) CLI_STATUS_ONLY=1 ;;
+        --no-nautical) CLI_NO_NAUTICAL=1 ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            echo "❌ Unknown option: $1" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+    shift
+done
+
+if [ "$#" -ne 0 ]; then
+    echo "❌ Unexpected positional arguments: $*" >&2
+    usage >&2
+    exit 2
+fi
+
+requested_force_sync=$CLI_FORCE_SYNC
+requested_status_only=$CLI_STATUS_ONLY
+requested_no_nautical=$CLI_NO_NAUTICAL
 
 if [ -f "$CONFIG_FILE" ]; then
     # shellcheck disable=SC1090
     . "$CONFIG_FILE"
+elif [ "$CONFIG_EXPLICIT" -eq 1 ]; then
+    echo "❌ Configuration file not found: $CONFIG_FILE" >&2
+    exit 2
+elif [ -f "$SCRIPT_DIR/task_sync.conf" ]; then
+    echo "⚠️  Ignoring legacy shared config: $SCRIPT_DIR/task_sync.conf" >&2
+    echo "   Copy it to $CONFIG_FILE or pass --config explicitly." >&2
 fi
+
+# Command-line controls take precedence over similarly named config variables.
+CLI_FORCE_SYNC=$requested_force_sync
+CLI_STATUS_ONLY=$requested_status_only
+CLI_NO_NAUTICAL=$requested_no_nautical
+
+# Optional per-device lookup tables default to empty strings.
+DEVICE_CONFIG_KEYS="${DEVICE_CONFIG_KEYS:-}"
+DEVICE_SYNC_IDS="${DEVICE_SYNC_IDS:-}"
+DEVICE_NAUTICAL_CORE_PATHS="${DEVICE_NAUTICAL_CORE_PATHS:-}"
+DEVICE_NAUTICAL_TOOLS_DIRS="${DEVICE_NAUTICAL_TOOLS_DIRS:-}"
+DEVICE_LOCK_DIRS="${DEVICE_LOCK_DIRS:-}"
+DEVICE_LOG_DIRS="${DEVICE_LOG_DIRS:-}"
+DEVICE_LOCAL_STATE_DIRS="${DEVICE_LOCAL_STATE_DIRS:-}"
 
 # Get current system info early so config can use per-device overrides.
 computer_name=$(hostname)
@@ -53,7 +149,7 @@ path_from_script_dir() {
     path="$1"
     case "$path" in
         "~") printf "%s\n" "$HOME" ;;
-        "~/"*) printf "%s\n" "$HOME/${path#~/}" ;;
+        \~/*) printf "%s\n" "$HOME/${path#\~/}" ;;
         ""|/*) printf "%s\n" "$path" ;;
         *) printf "%s\n" "$SCRIPT_DIR/$path" ;;
     esac
@@ -93,6 +189,11 @@ RUN_NAUTICAL_RECONCILE="${RUN_NAUTICAL_RECONCILE:-0}"
 NAUTICAL_CHAIN_REPAIR_APPLY="${NAUTICAL_CHAIN_REPAIR_APPLY:-0}"
 NAUTICAL_RECONCILE_APPLY="${NAUTICAL_RECONCILE_APPLY:-0}"
 RUN_NAUTICAL_ON_NO_SYNC="${RUN_NAUTICAL_ON_NO_SYNC:-0}"
+if [ "$CLI_NO_NAUTICAL" -eq 1 ]; then
+    RUN_NAUTICAL_CHAIN_REPAIR=0
+    RUN_NAUTICAL_RECONCILE=0
+    RUN_NAUTICAL_ON_NO_SYNC=0
+fi
 FORCE_SYNC_INTERVAL_SECONDS="${FORCE_SYNC_INTERVAL_SECONDS:-86400}"
 case "$FORCE_SYNC_INTERVAL_SECONDS" in
     ''|*[!0-9]*|0[0-9]*)
@@ -193,18 +294,24 @@ trap cleanup_runtime 0
 trap 'cleanup_runtime; exit 130' INT
 trap 'cleanup_runtime; exit 143' TERM
 
+repository_key=$(printf '%s' "$SCRIPT_DIR" | cksum | awk '{ print $1 }')
+local_state_home="${XDG_STATE_HOME:-${HOME:-$runtime_dir}/.local/state}"
+device_local_state_dir=$(lookup_device_path "$DEVICE_LOCAL_STATE_DIRS")
+LOCAL_STATE_DIR="${device_local_state_dir:-${LOCAL_STATE_DIR:-$local_state_home/taskwarrior-sync-helper/${repository_key}-${SIGNAL_DEVICE_KEY}}}"
+LOCAL_STATE_DIR=$(path_from_script_dir "$LOCAL_STATE_DIR")
+
 # ──────────────────────────────────────────────────────────────────────────
-# Per-device logging: each device writes to its own file to avoid conflicts
+# Per-device logging is local by default so it never creates shared conflicts.
 # DEVICE_ID:
 #   - default: "$USER@$HOSTNAME"
-#   - override: set LOG_DEVICE_ID="phone" (or any label) in task_sync.conf
+#   - override: set LOG_DEVICE_ID="phone" (or any label) in the local config
 # Sanitization ensures a safe filename across OS/filesystems.
-# Logs live under SCRIPT_DIR/logs/
+# Logs live under LOCAL_STATE_DIR/logs/
 # ──────────────────────────────────────────────────────────────────────────
 
 # Log dir and per-device log file
 device_log_dir=$(lookup_device_path "$DEVICE_LOG_DIRS")
-LOG_DIR="${device_log_dir:-${LOG_DIR:-$SCRIPT_DIR/logs}}"
+LOG_DIR="${device_log_dir:-${LOG_DIR:-$LOCAL_STATE_DIR/logs}}"
 LOG_DIR=$(path_from_script_dir "$LOG_DIR")
 if ! mkdir -p "$LOG_DIR"; then
     echo "❌ Unable to create task sync log directory: $LOG_DIR"
@@ -216,12 +323,6 @@ LOG_FILE="$LOG_DIR/task_sync_${DEVICE_ID_SAFE}.log"
 # acknowledges a captured snapshot in local state, never in the shared folder.
 SHARED_SIGNAL_DIR="${SHARED_SIGNAL_DIR:-$SCRIPT_DIR/sync_signals}"
 SHARED_SIGNAL_DIR=$(path_from_script_dir "$SHARED_SIGNAL_DIR")
-
-repository_key=$(printf '%s' "$SCRIPT_DIR" | cksum | awk '{ print $1 }')
-local_state_home="${XDG_STATE_HOME:-${HOME:-$runtime_dir}/.local/state}"
-device_local_state_dir=$(lookup_device_path "$DEVICE_LOCAL_STATE_DIRS")
-LOCAL_STATE_DIR="${device_local_state_dir:-${LOCAL_STATE_DIR:-$local_state_home/taskwarrior-sync-helper/${repository_key}-${SIGNAL_DEVICE_KEY}}}"
-LOCAL_STATE_DIR=$(path_from_script_dir "$LOCAL_STATE_DIR")
 
 if ! mkdir -p "$SHARED_SIGNAL_DIR" "$LOCAL_STATE_DIR"; then
     echo "❌ Unable to create sync signal or local state directory"
@@ -241,7 +342,6 @@ MAX_LOG_SIZE="${MAX_LOG_SIZE:-102400}"  # 100KB in bytes
 
 # Variables for final summary log
 SCRIPT_RESULT=""
-SYNC_ACTION=""
 ERROR_DETAILS=""
 CHANGES_INFO=""
 
@@ -622,8 +722,6 @@ perform_sync() {
     sync_type="$3"  # "WITH_CHANGES" or "NO_CHANGES"
     pre_sync_nautical_info=""
 
-    SYNC_ACTION="$sync_reason"
-
     if [ "$sync_type" = "WITH_CHANGES" ] && nautical_recovery_enabled; then
         echo "🧭 Running Nautical recovery before sync so spawned tasks are included..."
         if ! run_nautical_recovery_and_record; then
@@ -845,6 +943,11 @@ if [ "$FORCE_SYNC_INTERVAL_SECONDS" -gt 0 ]; then
     fi
 fi
 
+if [ "$CLI_FORCE_SYNC" -eq 1 ]; then
+    echo "🎯 Forced sync requested"
+    need_sync_for_different_system=1
+fi
+
 # Debug output
 echo "🔧 Debug Information:"
 echo "   📊 Local changes: $([ "$has_local_changes" -eq 1 ] && { [ -n "$local_operations_count" ] && echo "$local_operations_count operations" || echo "detected"; } || echo "none")"
@@ -854,6 +957,19 @@ echo "   📡 Shared generations: $shared_signal_count"
 echo "   📤 Pending publication: $([ "$pending_publication" -eq 1 ] && echo "YES" || echo "NO")"
 echo "   ⏰ Periodic fallback due: $([ "$forced_sync_due" -eq 1 ] && echo "YES" || echo "NO")"
 echo "   🔄 Need remote sync: $([ "$need_sync_for_different_system" -eq 1 ] && echo "YES" || echo "NO")"
+
+# Status mode evaluates the normal decision probes but never syncs, publishes
+# signals, advances the cursor, or runs Nautical recovery.
+if [ "$CLI_STATUS_ONLY" -eq 1 ]; then
+    if [ "$has_local_changes" -eq 1 ]; then
+        echo "STATUS=SYNC_LOCAL"
+    elif [ "$need_sync_for_different_system" -eq 1 ]; then
+        echo "STATUS=SYNC_REMOTE"
+    else
+        echo "STATUS=UP_TO_DATE"
+    fi
+    exit 0
+fi
 
 # Determine sync action
 if [ "$has_local_changes" -eq 1 ]; then

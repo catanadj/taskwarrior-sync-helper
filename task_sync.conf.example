@@ -1,4 +1,4 @@
-# Configuration for task_sync.sh.
+# Example configuration for task_sync.sh.
 #
 # Keep values shell-compatible: KEY=value, no spaces around "=".
 
@@ -6,14 +6,14 @@
 TASK_BIN=task
 PYTHON_BIN=python3
 
-# Nautical core location. This shared default can point either to:
+# Nautical core location. This default can point either to:
 #   - the directory that contains nautical_core/
 #   - the nautical_core/ directory itself
 # Default from task_sync.sh is the parent of this sync/ directory.
 NAUTICAL_CORE_PATH=~/.task
 #
-# If this sync/ folder is shared across devices with different paths, keep the
-# shared default above and list only exceptions below. Matching uses hostname by
+# If you intentionally deploy one config to devices with different paths, keep
+# the default above and list only exceptions below. Matching uses hostname by
 # default, with user@hostname as a fallback.
 #
 # If multiple devices have generic hostnames, map them to stable keys first:
@@ -51,7 +51,7 @@ NAUTICAL_CORE_PATH=~/.task
 
 # Runtime locations. Locks default to XDG_RUNTIME_DIR (or TMPDIR, then /tmp)
 # so a file-sharing service never treats a lock as cross-device state.
-# LOG_DIR is intentionally kept next to the script by default.
+# Logs default to LOCAL_STATE_DIR/logs.
 # LOCK_DIR=/tmp/task_sync.lock
 # DEVICE_LOG_DIRS='
 # phone=/storage/emulated/0/task-sync-logs

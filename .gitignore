@@ -1,5 +1,6 @@
 /logs/
 /sync_signals/
+/task_sync.conf
 /last_sync_state
 /last_sync_state.tmp.*
 /.task_sync.lock

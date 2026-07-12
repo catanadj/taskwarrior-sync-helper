@@ -2,7 +2,7 @@
 
 set -u
 
-PROJECT_DIR=$(CDPATH= cd "$(dirname "$0")/.." && pwd)
+PROJECT_DIR=$(CDPATH='' cd "$(dirname "$0")/.." && pwd)
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/task-sync-tests.XXXXXX") || exit 1
 failures=0
 tests_run=0
@@ -102,6 +102,7 @@ new_case() {
     cp "$PROJECT_DIR/task_sync.sh" "$CASE_DIR/task_sync.sh"
     chmod +x "$CASE_DIR/task_sync.sh"
     : > "$CASE_DIR/calls"
+    : > "$CASE_DIR/empty-config"
 
     cat > "$CASE_DIR/mock-task" <<'EOF'
 #!/bin/sh
@@ -199,7 +200,7 @@ run_case() {
     mode=$1
     shift
     env \
-        TASK_SYNC_CONFIG=/dev/null \
+        TASK_SYNC_CONFIG="$CASE_DIR/empty-config" \
         TASK_BIN="$CASE_DIR/mock-task" \
         LOCK_DIR="$CASE_DIR/lock" \
         LOG_DIR="$CASE_DIR/logs" \
@@ -210,6 +211,39 @@ run_case() {
         MOCK_MODE="$mode" \
         "$@" \
         "$CASE_DIR/task_sync.sh" > "$CASE_DIR/output" 2>&1
+    CASE_STATUS=$?
+}
+
+run_cli_case() {
+    mode=$1
+    shift
+    env \
+        TASK_SYNC_CONFIG="$CASE_DIR/empty-config" \
+        TASK_BIN="$CASE_DIR/mock-task" \
+        LOCK_DIR="$CASE_DIR/lock" \
+        LOG_DIR="$CASE_DIR/logs" \
+        SHARED_SIGNAL_DIR="$CASE_DIR/shared" \
+        LOCAL_STATE_DIR="$CASE_DIR/local-state" \
+        SYNC_DEVICE_ID=test-device \
+        MOCK_CALL_LOG="$CASE_DIR/calls" \
+        MOCK_MODE="$mode" \
+        "$CASE_DIR/task_sync.sh" "$@" > "$CASE_DIR/output" 2>&1
+    CASE_STATUS=$?
+}
+
+run_default_config_case() {
+    mode=$1
+    shift
+    env \
+        XDG_CONFIG_HOME="$CASE_DIR/xdg-config" \
+        TASK_BIN="$CASE_DIR/mock-task" \
+        LOCK_DIR="$CASE_DIR/lock" \
+        SHARED_SIGNAL_DIR="$CASE_DIR/shared" \
+        LOCAL_STATE_DIR="$CASE_DIR/local-state" \
+        SYNC_DEVICE_ID=test-device \
+        MOCK_CALL_LOG="$CASE_DIR/calls" \
+        MOCK_MODE="$mode" \
+        "$CASE_DIR/task_sync.sh" "$@" > "$CASE_DIR/output" 2>&1
     CASE_STATUS=$?
 }
 
@@ -378,6 +412,95 @@ else
     fail "invalid shared signal exits nonzero"
 fi
 assert_no_sync_call "invalid signal is not silently acknowledged"
+
+new_case cli_help
+run_cli_case none --help
+assert_status 0 "--help exits successfully"
+assert_output_contains "Usage:" "--help prints usage"
+assert_no_sync_call "--help does not access Taskwarrior"
+
+new_case cli_unknown
+run_cli_case none --unknown
+if [ "$CASE_STATUS" -eq 2 ]; then
+    pass "unknown CLI option exits with usage status"
+else
+    fail "unknown CLI option exits with usage status"
+fi
+assert_no_sync_call "unknown option does not access Taskwarrior"
+
+new_case cli_force
+run_case none
+: > "$CASE_DIR/calls"
+run_cli_case none --force
+assert_status 0 "--force succeeds"
+assert_output_contains "Forced sync requested" "--force is reported"
+assert_sync_call "--force invokes task sync"
+
+new_case cli_status
+run_case none
+: > "$CASE_DIR/calls"
+run_cli_case none --status
+assert_status 0 "--status succeeds"
+assert_output_contains "STATUS=UP_TO_DATE" "--status reports an up-to-date device"
+assert_no_sync_call "--status never invokes task sync"
+
+new_case cli_status_local
+run_cli_case local-v3 --status
+assert_output_contains "STATUS=SYNC_LOCAL" "--status reports local work"
+assert_no_sync_call "local --status does not upload"
+assert_no_shared_signal "local --status does not publish a generation"
+
+new_case cli_no_nautical
+cat > "$CASE_DIR/config" <<EOF
+RUN_NAUTICAL_CHAIN_REPAIR=1
+NAUTICAL_TOOLS_DIR=$CASE_DIR/missing-tools
+EOF
+run_cli_case local-v3 --config "$CASE_DIR/config" --no-nautical
+assert_status 0 "--no-nautical overrides enabled recovery"
+assert_sync_call "--no-nautical still permits task sync"
+
+new_case cli_missing_config
+run_cli_case none --config "$CASE_DIR/missing-config"
+if [ "$CASE_STATUS" -eq 2 ]; then
+    pass "missing explicit config exits with usage status"
+else
+    fail "missing explicit config exits with usage status"
+fi
+assert_no_sync_call "missing config does not access Taskwarrior"
+
+new_case default_local_config
+mkdir -p "$CASE_DIR/xdg-config/taskwarrior-sync-helper"
+cat > "$CASE_DIR/xdg-config/taskwarrior-sync-helper/config" <<'EOF'
+SYNC_DEVICE_ID=from-local-config
+FORCE_SYNC_INTERVAL_SECONDS=0
+EOF
+run_default_config_case none --status
+assert_status 0 "default XDG config loads"
+assert_output_contains "Sync device ID: from-local-config" "local config controls device identity"
+
+new_case legacy_shared_config
+cat > "$CASE_DIR/task_sync.conf" <<'EOF'
+TASK_BIN=/definitely/not/task
+EOF
+run_default_config_case none --status
+assert_status 0 "legacy shared config is ignored by default"
+assert_output_contains "Ignoring legacy shared config" "ignored shared config emits migration guidance"
+
+new_case local_log_default
+env \
+    TASK_SYNC_CONFIG="$CASE_DIR/empty-config" \
+    TASK_BIN="$CASE_DIR/mock-task" \
+    LOCK_DIR="$CASE_DIR/lock" \
+    SHARED_SIGNAL_DIR="$CASE_DIR/shared" \
+    LOCAL_STATE_DIR="$CASE_DIR/local-state" \
+    SYNC_DEVICE_ID=test-device \
+    MOCK_CALL_LOG="$CASE_DIR/calls" \
+    MOCK_MODE=none \
+    "$CASE_DIR/task_sync.sh" > "$CASE_DIR/output" 2>&1
+CASE_STATUS=$?
+assert_status 0 "default local logging succeeds"
+set -- "$CASE_DIR/local-state/logs"/*.log
+assert_file_exists "$1" "default log is stored under local state"
 
 printf '1..%s\n' "$tests_run"
 if [ "$failures" -ne 0 ]; then

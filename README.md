@@ -30,20 +30,30 @@ chmod +x task_sync.sh
 ./task_sync.sh
 ```
 
-Edit `task_sync.conf` if your paths or options differ.
+No config is required for the safe defaults. To customize them, create a local
+config outside the synchronized folder:
 
-To use a config elsewhere, set `TASK_SYNC_CONFIG=/path/to/task_sync.conf`.
+```sh
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/taskwarrior-sync-helper"
+mkdir -p "$config_dir"
+cp task_sync.conf.example "$config_dir/config"
+```
+
+You can also use `--config /path/to/config` or set `TASK_SYNC_CONFIG`. An old
+`task_sync.conf` beside the script is intentionally ignored unless selected
+explicitly, because sourced configuration is executable shell and should not
+come from a synchronized folder.
 
 Each device needs a stable, unique sync identity. The default is
 `user@hostname`. If that can change, configure `DEVICE_SYNC_IDS` as shown in
-`task_sync.conf`. Never reuse one sync identity on two devices.
+`task_sync.conf.example`. Never reuse one sync identity on two devices.
 
 For regular use, call `task_sync.sh` from cron, systemd, Termux, a launcher, or
 whatever you currently use to run `task sync`.
 
 ## Main Config
 
-`task_sync.conf` is a shell file. Use `KEY=value`, with no spaces around `=`.
+The local config is a shell file. Use `KEY=value`, with no spaces around `=`.
 
 Common settings:
 
@@ -63,7 +73,17 @@ FORCE_SYNC_INTERVAL_SECONDS=86400
 ```
 
 If different devices use different paths, use the per-device examples already
-included in `task_sync.conf`.
+included in `task_sync.conf.example`.
+
+## Command Options
+
+```text
+--config PATH   Use an explicit configuration file
+--force         Sync even when no local or signaled changes exist
+--status        Show STATUS=SYNC_LOCAL, SYNC_REMOTE, or UP_TO_DATE without sync
+--no-nautical   Disable Nautical recovery for this run
+--help          Show built-in usage
+```
 
 ## Nautical Behavior
 
@@ -103,9 +123,8 @@ fallback.
 ## Generated Files
 
 - `sync_signals/<device>.signal` - shared, single-writer device generations
-- `logs/task_sync_<device>.log` - per-device log
 - `$XDG_STATE_HOME/taskwarrior-sync-helper/...` - local cursor, generation, and
-  pending-publication state; falls back to `~/.local/state`
+  pending-publication state plus per-device logs; falls back to `~/.local/state`
 - `$XDG_RUNTIME_DIR/taskwarrior-sync-helper-<device>.lock` - local lock directory
   while the script is running; falls back to `$TMPDIR`, then `/tmp`
 
@@ -131,7 +150,8 @@ Run the isolated regression suite with:
 ```
 
 The suite uses a fake Taskwarrior command and temporary directories; it does not
-read or modify your real task database.
+read or modify your real task database. GitHub Actions runs the suite with both
+the system shell and BusyBox, along with POSIX syntax checks and ShellCheck.
 
 ## License
 
