@@ -65,6 +65,24 @@ if [ -z "$device_config_alias" ]; then
 fi
 DEVICE_CONFIG_KEY="${DEVICE_CONFIG_KEY:-${device_config_alias:-$computer_name}}"
 
+device_sync_id=$(lookup_device_path "$DEVICE_SYNC_IDS")
+SYNC_DEVICE_ID="${device_sync_id:-${SYNC_DEVICE_ID:-$current_system}}"
+if [ -z "$SYNC_DEVICE_ID" ]; then
+    echo "❌ SYNC_DEVICE_ID must not be empty"
+    exit 1
+fi
+newline='
+'
+case "$SYNC_DEVICE_ID" in
+    *"$newline"*)
+        echo "❌ SYNC_DEVICE_ID must not contain a newline"
+        exit 1
+        ;;
+esac
+SYNC_DEVICE_ID_SAFE=$(printf '%s' "$SYNC_DEVICE_ID" | LC_ALL=C tr -c 'A-Za-z0-9._-' '-')
+SYNC_DEVICE_ID_CHECKSUM=$(printf '%s' "$SYNC_DEVICE_ID" | cksum | awk '{ print $1 }')
+SIGNAL_DEVICE_KEY="${SYNC_DEVICE_ID_SAFE}-${SYNC_DEVICE_ID_CHECKSUM}"
+
 TASK_BIN="${TASK_BIN:-task}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 device_nautical_core_path=$(lookup_device_path "$DEVICE_NAUTICAL_CORE_PATHS")
@@ -75,6 +93,13 @@ RUN_NAUTICAL_RECONCILE="${RUN_NAUTICAL_RECONCILE:-0}"
 NAUTICAL_CHAIN_REPAIR_APPLY="${NAUTICAL_CHAIN_REPAIR_APPLY:-0}"
 NAUTICAL_RECONCILE_APPLY="${NAUTICAL_RECONCILE_APPLY:-0}"
 RUN_NAUTICAL_ON_NO_SYNC="${RUN_NAUTICAL_ON_NO_SYNC:-0}"
+FORCE_SYNC_INTERVAL_SECONDS="${FORCE_SYNC_INTERVAL_SECONDS:-86400}"
+case "$FORCE_SYNC_INTERVAL_SECONDS" in
+    ''|*[!0-9]*|0[0-9]*)
+        echo "❌ FORCE_SYNC_INTERVAL_SECONDS must be a non-negative integer"
+        exit 1
+        ;;
+esac
 
 resolve_nautical_base() {
     path="$1"
@@ -104,6 +129,13 @@ cleanup_lock() {
     if [ "$lock_owner" = "$$" ]; then
         rm -f "$LOCK_DIR/pid"
         rmdir "$LOCK_DIR" 2>/dev/null || true
+    fi
+}
+
+cleanup_runtime() {
+    cleanup_lock
+    if [ -n "${SIGNAL_SNAPSHOT_FILE:-}" ]; then
+        rm -f "$SIGNAL_SNAPSHOT_FILE" "${SIGNAL_SNAPSHOT_FILE}.unsorted"
     fi
 }
 
@@ -157,9 +189,9 @@ if ! acquire_lock; then
     exit 1
 fi
 
-trap cleanup_lock 0
-trap 'cleanup_lock; exit 130' INT
-trap 'cleanup_lock; exit 143' TERM
+trap cleanup_runtime 0
+trap 'cleanup_runtime; exit 130' INT
+trap 'cleanup_runtime; exit 143' TERM
 
 # ──────────────────────────────────────────────────────────────────────────
 # Per-device logging: each device writes to its own file to avoid conflicts
@@ -180,8 +212,29 @@ if ! mkdir -p "$LOG_DIR"; then
 fi
 LOG_FILE="$LOG_DIR/task_sync_${DEVICE_ID_SAFE}.log"
 
-# Sync state file (shared state is intentional; only logs are per-device)
-SYNC_STATE_FILE="$SCRIPT_DIR/last_sync_state"
+# Cross-device notifications are single-writer generation files. Each device
+# acknowledges a captured snapshot in local state, never in the shared folder.
+SHARED_SIGNAL_DIR="${SHARED_SIGNAL_DIR:-$SCRIPT_DIR/sync_signals}"
+SHARED_SIGNAL_DIR=$(path_from_script_dir "$SHARED_SIGNAL_DIR")
+
+repository_key=$(printf '%s' "$SCRIPT_DIR" | cksum | awk '{ print $1 }')
+local_state_home="${XDG_STATE_HOME:-${HOME:-$runtime_dir}/.local/state}"
+device_local_state_dir=$(lookup_device_path "$DEVICE_LOCAL_STATE_DIRS")
+LOCAL_STATE_DIR="${device_local_state_dir:-${LOCAL_STATE_DIR:-$local_state_home/taskwarrior-sync-helper/${repository_key}-${SIGNAL_DEVICE_KEY}}}"
+LOCAL_STATE_DIR=$(path_from_script_dir "$LOCAL_STATE_DIR")
+
+if ! mkdir -p "$SHARED_SIGNAL_DIR" "$LOCAL_STATE_DIR"; then
+    echo "❌ Unable to create sync signal or local state directory"
+    exit 1
+fi
+
+LOCAL_CURSOR_FILE="$LOCAL_STATE_DIR/seen_signals"
+LOCAL_GENERATION_FILE="$LOCAL_STATE_DIR/published_generation"
+PENDING_GENERATION_FILE="$LOCAL_STATE_DIR/pending_generation"
+LAST_SUCCESS_FILE="$LOCAL_STATE_DIR/last_success_epoch"
+OWN_SIGNAL_FILE="$SHARED_SIGNAL_DIR/${SIGNAL_DEVICE_KEY}.signal"
+SIGNAL_SNAPSHOT_FILE="$LOCAL_STATE_DIR/signal_snapshot.$$"
+LEGACY_SYNC_STATE_FILE="$SCRIPT_DIR/last_sync_state"
 
 # Max per-log size (100KB)
 MAX_LOG_SIZE="${MAX_LOG_SIZE:-102400}"  # 100KB in bytes
@@ -224,50 +277,191 @@ write_summary_log() {
     fi
 }
 
-# Function to update sync state file
-update_sync_state() {
-    sync_type="$1"  # "WITH_CHANGES" or "NO_CHANGES"
-    state_timestamp=$(current_timestamp)
-    state_tmp="${SYNC_STATE_FILE}.tmp.$$"
-
-    {
-        echo "LAST_SYNC_TIME=$state_timestamp"
-        echo "LAST_SYNC_SYSTEM=$current_system"
-        echo "LAST_SYNC_TYPE=$sync_type"
-    } > "$state_tmp" || return 1
-
-    mv "$state_tmp" "$SYNC_STATE_FILE"
+# Read the one generation value from a shared signal file.
+read_signal_generation() {
+    signal_file="$1"
+    awk -F= '
+        $1 == "GENERATION" { count++; value = $2 }
+        END {
+            if (count == 1 && value ~ /^(0|[1-9][0-9]*)$/) {
+                print value
+                exit 0
+            }
+            exit 1
+        }
+    ' "$signal_file" 2>/dev/null
 }
 
-# Function to mark that current system has synced the latest changes
-mark_system_synced() {
-    if [ ! -f "$SYNC_STATE_FILE" ]; then
+read_numeric_state() {
+    numeric_file="$1"
+    numeric_value=$(sed -n '1p' "$numeric_file" 2>/dev/null)
+    case "$numeric_value" in
+        ''|*[!0-9]*|0[0-9]*) return 1 ;;
+    esac
+    if [ "$(wc -l < "$numeric_file" 2>/dev/null)" -ne 1 ]; then
+        return 1
+    fi
+    printf '%s\n' "$numeric_value"
+}
+
+write_numeric_state() {
+    numeric_file="$1"
+    numeric_value="$2"
+    numeric_tmp="${numeric_file}.tmp.$$"
+    printf '%s\n' "$numeric_value" > "$numeric_tmp" || return 1
+    mv "$numeric_tmp" "$numeric_file"
+}
+
+# Capture a sorted point-in-time view. Signals arriving or advancing after this
+# capture remain different from the committed local cursor and trigger another
+# sync on the next run.
+capture_signal_snapshot() {
+    snapshot_target="$1"
+    snapshot_unsorted="${snapshot_target}.unsorted"
+    : > "$snapshot_unsorted" || return 1
+
+    for signal_file in "$SHARED_SIGNAL_DIR"/*.signal; do
+        [ -f "$signal_file" ] || continue
+        signal_name=${signal_file##*/}
+        signal_key=${signal_name%.signal}
+        if ! signal_generation=$(read_signal_generation "$signal_file"); then
+            echo "❌ Invalid shared sync signal: $signal_file" >&2
+            rm -f "$snapshot_unsorted"
+            return 1
+        fi
+        printf '%s=%s\n' "$signal_key" "$signal_generation" >> "$snapshot_unsorted" || {
+            rm -f "$snapshot_unsorted"
+            return 1
+        }
+    done
+
+    if ! LC_ALL=C sort "$snapshot_unsorted" > "$snapshot_target"; then
+        rm -f "$snapshot_unsorted" "$snapshot_target"
+        return 1
+    fi
+    rm -f "$snapshot_unsorted"
+}
+
+commit_signal_snapshot() {
+    cursor_tmp="${LOCAL_CURSOR_FILE}.tmp.$$"
+    cp "$SIGNAL_SNAPSHOT_FILE" "$cursor_tmp" || return 1
+    mv "$cursor_tmp" "$LOCAL_CURSOR_FILE"
+}
+
+cursor_set_generation() {
+    cursor_key="$1"
+    cursor_generation="$2"
+    cursor_unsorted="${LOCAL_CURSOR_FILE}.unsorted.$$"
+    cursor_tmp="${LOCAL_CURSOR_FILE}.tmp.$$"
+
+    if [ -f "$LOCAL_CURSOR_FILE" ]; then
+        awk -F= -v key="$cursor_key" '$1 != key' "$LOCAL_CURSOR_FILE" > "$cursor_unsorted" || return 1
+    else
+        : > "$cursor_unsorted" || return 1
+    fi
+    printf '%s=%s\n' "$cursor_key" "$cursor_generation" >> "$cursor_unsorted" || return 1
+    if ! LC_ALL=C sort "$cursor_unsorted" > "$cursor_tmp"; then
+        rm -f "$cursor_unsorted" "$cursor_tmp"
+        return 1
+    fi
+    rm -f "$cursor_unsorted"
+    mv "$cursor_tmp" "$LOCAL_CURSOR_FILE"
+}
+
+load_pending_generation() {
+    if [ ! -f "$PENDING_GENERATION_FILE" ]; then
+        return 1
+    fi
+    if ! PENDING_GENERATION=$(read_numeric_state "$PENDING_GENERATION_FILE"); then
+        echo "❌ Invalid pending publication state: $PENDING_GENERATION_FILE" >&2
+        return 2
+    fi
+    return 0
+}
+
+# Reserve a durable generation before uploading local changes. If the process
+# dies after `task sync` but before publishing, the pending reservation forces a
+# safe retry and prevents the notification from being lost.
+ensure_pending_generation() {
+    load_pending_generation
+    pending_status=$?
+    if [ "$pending_status" -eq 0 ]; then
+        return 0
+    fi
+    if [ "$pending_status" -eq 2 ]; then
         return 1
     fi
 
-    SYNCED_SYSTEMS=$(grep "^SYNCED_SYSTEMS=" "$SYNC_STATE_FILE" 2>/dev/null | cut -d'=' -f2-)
-
-    if ! system_is_synced "$SYNCED_SYSTEMS" "$current_system"; then
-        if [ -n "$SYNCED_SYSTEMS" ]; then
-            SYNCED_SYSTEMS="$SYNCED_SYSTEMS,$current_system"
-        else
-            SYNCED_SYSTEMS="$current_system"
+    max_generation=0
+    if [ -f "$LOCAL_GENERATION_FILE" ]; then
+        if ! local_generation=$(read_numeric_state "$LOCAL_GENERATION_FILE"); then
+            echo "❌ Invalid local generation state: $LOCAL_GENERATION_FILE" >&2
+            return 1
         fi
-
-        state_tmp="${SYNC_STATE_FILE}.tmp.$$"
-        awk '!/^SYNCED_SYSTEMS=/' "$SYNC_STATE_FILE" > "$state_tmp" 2>/dev/null || return 1
-        echo "SYNCED_SYSTEMS=$SYNCED_SYSTEMS" >> "$state_tmp" || return 1
-        mv "$state_tmp" "$SYNC_STATE_FILE" || return 1
+        max_generation="$local_generation"
     fi
+    if [ -f "$OWN_SIGNAL_FILE" ]; then
+        if ! shared_generation=$(read_signal_generation "$OWN_SIGNAL_FILE"); then
+            echo "❌ Invalid own shared signal: $OWN_SIGNAL_FILE" >&2
+            return 1
+        fi
+        if [ "$shared_generation" -gt "$max_generation" ]; then
+            max_generation="$shared_generation"
+        fi
+    fi
+
+    PENDING_GENERATION=$((max_generation + 1))
+    write_numeric_state "$PENDING_GENERATION_FILE" "$PENDING_GENERATION"
 }
 
-system_is_synced() {
-    systems_csv="$1"
-    system_name="$2"
-    case ",$systems_csv," in
-        *,"$system_name",*) return 0 ;;
-        *) return 1 ;;
+publish_pending_generation() {
+    if ! load_pending_generation; then
+        return 1
+    fi
+
+    if [ -f "$OWN_SIGNAL_FILE" ]; then
+        if ! current_shared_generation=$(read_signal_generation "$OWN_SIGNAL_FILE"); then
+            echo "❌ Invalid own shared signal: $OWN_SIGNAL_FILE" >&2
+            return 1
+        fi
+        if [ "$current_shared_generation" -gt "$PENDING_GENERATION" ]; then
+            echo "❌ Own signal advanced unexpectedly; SYNC_DEVICE_ID may be used by another device" >&2
+            return 1
+        fi
+    fi
+
+    signal_tmp="${OWN_SIGNAL_FILE}.tmp.$$"
+    {
+        echo "SIGNAL_VERSION=1"
+        echo "DEVICE_ID=$SYNC_DEVICE_ID"
+        echo "GENERATION=$PENDING_GENERATION"
+        echo "UPDATED_AT=$(current_timestamp)"
+    } > "$signal_tmp" || return 1
+    mv "$signal_tmp" "$OWN_SIGNAL_FILE"
+}
+
+finalize_local_sync_signal() {
+    if ! publish_pending_generation; then
+        return 1
+    fi
+    if ! commit_signal_snapshot; then
+        return 1
+    fi
+    if ! cursor_set_generation "$SIGNAL_DEVICE_KEY" "$PENDING_GENERATION"; then
+        return 1
+    fi
+    if ! write_numeric_state "$LOCAL_GENERATION_FILE" "$PENDING_GENERATION"; then
+        return 1
+    fi
+    rm -f "$PENDING_GENERATION_FILE"
+}
+
+record_successful_sync() {
+    sync_epoch=$(date '+%s')
+    case "$sync_epoch" in
+        ''|*[!0-9]*) return 1 ;;
     esac
+    write_numeric_state "$LAST_SUCCESS_FILE" "$sync_epoch"
 }
 
 # Query Taskwarrior using output intended for automation. The result is exposed
@@ -440,6 +634,12 @@ perform_sync() {
         pre_sync_nautical_info=", $NAUTICAL_RECOVERY_RESULT"
     fi
 
+    if [ "$sync_type" = "WITH_CHANGES" ] && ! ensure_pending_generation; then
+        SCRIPT_RESULT="ERROR"
+        ERROR_DETAILS="Unable to reserve a sync signal generation"
+        return 1
+    fi
+
     # Prepare changes info for summary
     if [ "$sync_type" = "WITH_CHANGES" ] && [ -n "$local_operations_count" ]; then
         echo "🔄 $sync_reason - Syncing $local_operations_count local operations"
@@ -513,36 +713,36 @@ perform_sync() {
         CHANGES_INFO="$CHANGES_INFO, $NAUTICAL_RECOVERY_RESULT"
     fi
 
-    # Commit shared state only after sync and recovery have succeeded.
+    # Publish local work and acknowledge only the snapshot captured before the
+    # sync. A later signal is deliberately left pending for the next run.
     if [ "$sync_type" = "WITH_CHANGES" ]; then
-        if ! update_sync_state "$sync_type" || ! mark_system_synced; then
+        if ! finalize_local_sync_signal; then
             SCRIPT_RESULT="ERROR"
-            ERROR_DETAILS="Unable to update shared sync state"
+            ERROR_DETAILS="Unable to publish or commit sync signal state"
             return 1
         fi
     else
         probe_local_changes
         post_probe_status=$?
         if [ "$post_probe_status" -eq 0 ]; then
-            echo "⚠️  WARNING: Local changes still exist after sync"
-            echo "🚫 Not marking system as synced due to remaining local changes"
+            echo "⚠️  Local changes remain after pulling remote changes"
             CHANGES_INFO="$CHANGES_INFO (local changes remain)"
         elif [ "$post_probe_status" -eq 2 ]; then
             SCRIPT_RESULT="ERROR"
             ERROR_DETAILS="Unable to verify local state after sync"
             return 1
-        else
-            if [ "$INITIALIZE_SYNC_STATE" -eq 1 ] && ! update_sync_state "NO_CHANGES"; then
-                SCRIPT_RESULT="ERROR"
-                ERROR_DETAILS="Unable to initialize shared sync state"
-                return 1
-            fi
-            if ! mark_system_synced; then
-                SCRIPT_RESULT="ERROR"
-                ERROR_DETAILS="Unable to mark system as synced"
-                return 1
-            fi
         fi
+        if ! commit_signal_snapshot; then
+            SCRIPT_RESULT="ERROR"
+            ERROR_DETAILS="Unable to commit local signal cursor"
+            return 1
+        fi
+    fi
+
+    if ! record_successful_sync; then
+        SCRIPT_RESULT="ERROR"
+        ERROR_DETAILS="Unable to record successful sync time"
+        return 1
     fi
 
     SCRIPT_RESULT="SUCCESS"
@@ -580,58 +780,89 @@ case "$initial_probe_status" in
         ;;
 esac
 
-# Check if sync state file exists and read it
-need_sync_for_different_system=0
-INITIALIZE_SYNC_STATE=0
-if [ -f "$SYNC_STATE_FILE" ]; then
-    LAST_SYNC_TIME=$(grep "^LAST_SYNC_TIME=" "$SYNC_STATE_FILE" | cut -d'=' -f2-)
-    LAST_SYNC_SYSTEM=$(grep "^LAST_SYNC_SYSTEM=" "$SYNC_STATE_FILE" | cut -d'=' -f2-)
-    LAST_SYNC_TYPE=$(grep "^LAST_SYNC_TYPE=" "$SYNC_STATE_FILE" | cut -d'=' -f2-)
-    SYNCED_SYSTEMS=$(grep "^SYNCED_SYSTEMS=" "$SYNC_STATE_FILE" | cut -d'=' -f2-)
+# A pending publication means a previous run may have uploaded local changes but
+# exited before notifying other devices. Force a safe sync and republish it.
+pending_publication=0
+load_pending_generation
+pending_status=$?
+case "$pending_status" in
+    0)
+        pending_publication=1
+        has_local_changes=1
+        echo "📤 Pending generation $PENDING_GENERATION still needs publication"
+        ;;
+    1) ;;
+    *)
+        write_summary_log "ERROR" "LOCAL_STATE_INVALID" "Pending generation state is invalid"
+        exit 1
+        ;;
+esac
 
-    state_is_valid=1
-    if [ -z "$LAST_SYNC_TIME" ] || [ -z "$LAST_SYNC_SYSTEM" ]; then
-        state_is_valid=0
+if ! capture_signal_snapshot "$SIGNAL_SNAPSHOT_FILE"; then
+    write_summary_log "ERROR" "SIGNAL_SNAPSHOT_FAILED" "Unable to read shared sync signals"
+    exit 1
+fi
+
+# Compare the captured shared generations with this device's local cursor.
+need_sync_for_different_system=0
+if [ ! -f "$LOCAL_CURSOR_FILE" ]; then
+    if [ -f "$LEGACY_SYNC_STATE_FILE" ]; then
+        echo "🔁 Legacy last_sync_state detected; running a one-time migration sync"
+    else
+        echo "🆕 No local signal cursor found - this appears to be the first run"
     fi
-    case "$LAST_SYNC_TYPE" in
-        WITH_CHANGES|NO_CHANGES) ;;
-        *) state_is_valid=0 ;;
+    need_sync_for_different_system=1
+elif cmp -s "$SIGNAL_SNAPSHOT_FILE" "$LOCAL_CURSOR_FILE"; then
+    echo "✅ This device has observed all current shared generations"
+else
+    echo "🔄 One or more device generations changed"
+    echo "📥 Current device $SYNC_DEVICE_ID has not synced this signal snapshot"
+    need_sync_for_different_system=1
+fi
+shared_signal_count=$(awk 'END { print NR + 0 }' "$SIGNAL_SNAPSHOT_FILE")
+
+# Signals cover helper-managed clients. A periodic full sync also catches
+# clients that bypass the helper or a notification missed by the shared folder.
+forced_sync_due=0
+if [ "$FORCE_SYNC_INTERVAL_SECONDS" -gt 0 ]; then
+    current_epoch=$(date '+%s')
+    case "$current_epoch" in
+        ''|*[!0-9]*)
+            write_summary_log "ERROR" "CLOCK_FAILED" "Unable to read current epoch time"
+            exit 1
+            ;;
     esac
 
-    if [ "$state_is_valid" -eq 0 ]; then
-        echo "⚠️  Shared sync state is incomplete or invalid; running a conservative sync"
-        need_sync_for_different_system=1
-        INITIALIZE_SYNC_STATE=1
-    elif [ "$LAST_SYNC_TYPE" = "WITH_CHANGES" ] && ! system_is_synced "$SYNCED_SYSTEMS" "$current_system"; then
-        echo "🔄 Changes available from $LAST_SYNC_SYSTEM (at $LAST_SYNC_TIME)"
-        echo "📥 Current system $current_system has not synced these changes yet"
-        need_sync_for_different_system=1
-    elif [ "$LAST_SYNC_TYPE" = "WITH_CHANGES" ] && system_is_synced "$SYNCED_SYSTEMS" "$current_system"; then
-        echo "✅ Current system has already synced the latest changes from $LAST_SYNC_SYSTEM"
+    if ! last_success_epoch=$(read_numeric_state "$LAST_SUCCESS_FILE"); then
+        forced_sync_due=1
+    elif [ "$current_epoch" -lt "$last_success_epoch" ] || [ $((current_epoch - last_success_epoch)) -ge "$FORCE_SYNC_INTERVAL_SECONDS" ]; then
+        forced_sync_due=1
     fi
-else
-    echo "🆕 No sync state file found - this appears to be the first run"
-    need_sync_for_different_system=1
-    INITIALIZE_SYNC_STATE=1
+
+    if [ "$forced_sync_due" -eq 1 ]; then
+        echo "⏰ Periodic fallback sync is due"
+        need_sync_for_different_system=1
+    fi
 fi
 
 # Debug output
 echo "🔧 Debug Information:"
 echo "   📊 Local changes: $([ "$has_local_changes" -eq 1 ] && { [ -n "$local_operations_count" ] && echo "$local_operations_count operations" || echo "detected"; } || echo "none")"
 echo "   📋 Current pending tasks: $initial_task_count"
-if [ -f "$SYNC_STATE_FILE" ]; then
-    echo "   💻 Last sync system: $LAST_SYNC_SYSTEM"
-    echo "   🏠 Current system: $current_system"
-    echo "   📅 Last sync type: $LAST_SYNC_TYPE"
-    echo "   🔗 Systems match: $([ "$LAST_SYNC_SYSTEM" = "$current_system" ] && echo "YES" || echo "NO")"
-    echo "   📝 Last sync had changes: $([ "$LAST_SYNC_TYPE" = "WITH_CHANGES" ] && echo " YES" || echo " NO")"
-fi
-echo "   🔄 Need remote sync: $([ $need_sync_for_different_system -eq 1 ] && echo "YES" || echo "NO")"
+echo "   🆔 Sync device ID: $SYNC_DEVICE_ID"
+echo "   📡 Shared generations: $shared_signal_count"
+echo "   📤 Pending publication: $([ "$pending_publication" -eq 1 ] && echo "YES" || echo "NO")"
+echo "   ⏰ Periodic fallback due: $([ "$forced_sync_due" -eq 1 ] && echo "YES" || echo "NO")"
+echo "   🔄 Need remote sync: $([ "$need_sync_for_different_system" -eq 1 ] && echo "YES" || echo "NO")"
 
 # Determine sync action
 if [ "$has_local_changes" -eq 1 ]; then
-    echo "🚀 Decision: Syncing due to local changes"
-    if perform_sync "Local changes detected" "$local_operations_count" "WITH_CHANGES"; then
+    local_sync_reason="Local changes detected"
+    if [ "$pending_publication" -eq 1 ] && [ -z "$local_operations_count" ]; then
+        local_sync_reason="Completing pending signal publication"
+    fi
+    echo "🚀 Decision: $local_sync_reason"
+    if perform_sync "$local_sync_reason" "$local_operations_count" "WITH_CHANGES"; then
         echo "🎉 Sync completed successfully"
         write_summary_log "$SCRIPT_RESULT" "SYNC_LOCAL_CHANGES" "$CHANGES_INFO"
     else
@@ -666,10 +897,5 @@ else
             exit 1
         fi
     fi
-    if [ -f "$SYNC_STATE_FILE" ]; then
-        echo "📅 Last sync: $LAST_SYNC_SYSTEM at $LAST_SYNC_TIME ($LAST_SYNC_TYPE)"
-        write_summary_log "INFO" "NO_SYNC_NEEDED" "up-to-date, $current_task_count pending tasks, last sync: $LAST_SYNC_SYSTEM at $LAST_SYNC_TIME$recovery_info"
-    else
-        write_summary_log "INFO" "NO_SYNC_NEEDED" "up-to-date, $current_task_count pending tasks, no previous sync state$recovery_info"
-    fi
+    write_summary_log "INFO" "NO_SYNC_NEEDED" "up-to-date, $current_task_count pending tasks, $shared_signal_count shared generations$recovery_info"
 fi

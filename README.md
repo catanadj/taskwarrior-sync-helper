@@ -5,8 +5,8 @@ device.
 
 Put this folder somewhere shared by Syncthing, Dropbox, or similar. Run
 `task_sync.sh` instead of running `task sync` directly. It checks whether sync
-is actually needed, runs it when useful, and keeps a small shared state file so
-each device knows whether it already pulled the latest changes.
+is actually needed, runs it when useful, and uses per-device generation signals
+so each device knows whether it already pulled the latest changes.
 
 It can also run Taskwarrior Nautical recovery tools. This matters when you
 complete Nautical recurring tasks on a client that does not run hooks, such as
@@ -34,6 +34,10 @@ Edit `task_sync.conf` if your paths or options differ.
 
 To use a config elsewhere, set `TASK_SYNC_CONFIG=/path/to/task_sync.conf`.
 
+Each device needs a stable, unique sync identity. The default is
+`user@hostname`. If that can change, configure `DEVICE_SYNC_IDS` as shown in
+`task_sync.conf`. Never reuse one sync identity on two devices.
+
 For regular use, call `task_sync.sh` from cron, systemd, Termux, a launcher, or
 whatever you currently use to run `task sync`.
 
@@ -55,6 +59,7 @@ RUN_NAUTICAL_RECONCILE=0
 NAUTICAL_RECONCILE_APPLY=0
 
 RUN_NAUTICAL_ON_NO_SYNC=0
+FORCE_SYNC_INTERVAL_SECONDS=86400
 ```
 
 If different devices use different paths, use the per-device examples already
@@ -79,12 +84,34 @@ run a tool in dry-run mode, then set its `*_APPLY` option to `1` only when you
 are ready for it to modify tasks. A missing or failing enabled recovery tool
 causes the helper to fail instead of silently continuing.
 
+## Coordination Behavior
+
+Each device writes only its own file under `sync_signals/` and advances its
+generation after uploading local changes. Other devices compare those shared
+generations with a cursor stored outside the synchronized folder.
+
+The cursor records the snapshot captured before `task sync`. If another signal
+arrives while sync is running, it remains unacknowledged and triggers another
+sync. A locally persisted pending generation also ensures that a process crash
+after upload cannot lose the notification.
+
+A full sync also runs after `FORCE_SYNC_INTERVAL_SECONDS` without a successful
+sync. The daily default catches changes from clients that bypass the helper or
+notifications missed by the file-sharing service. Set it to `0` to disable this
+fallback.
+
 ## Generated Files
 
-- `last_sync_state` - shared sync state
+- `sync_signals/<device>.signal` - shared, single-writer device generations
 - `logs/task_sync_<device>.log` - per-device log
+- `$XDG_STATE_HOME/taskwarrior-sync-helper/...` - local cursor, generation, and
+  pending-publication state; falls back to `~/.local/state`
 - `$XDG_RUNTIME_DIR/taskwarrior-sync-helper-<device>.lock` - local lock directory
   while the script is running; falls back to `$TMPDIR`, then `/tmp`
+
+An existing `last_sync_state` from an older version is not modified. On the
+first upgraded run, its presence causes one conservative migration sync and a
+new local cursor is created.
 
 ## Notes
 
